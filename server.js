@@ -82,22 +82,57 @@ Host: https://${mirrorHost}`
 // ============================================================
 // 0b. CUSTOM SITEMAP PROXY (rewrite origin → mirror)
 // ============================================================
-app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml", "/wp-sitemap*.xml"], async (req, res) => {
-  const mirrorHost = getMirrorHost(req);
-  try {
-    const originUrl = `https://${ORIGIN_HOST}${req.path}`;
-    const resp = await fetch(originUrl, {
+// Helper: fetch sitemap XML with manual redirect handling to avoid loops
+async function fetchSitemapXml(urlStr, maxRedirects = 5) {
+  let currentUrl = urlStr;
+  for (let i = 0; i < maxRedirects; i++) {
+    const parsedUrl = new URL(currentUrl);
+    const resp = await fetch(currentUrl, {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-        Host: ORIGIN_HOST,
+        Host: parsedUrl.hostname,
         Accept: "text/xml,application/xml,*/*",
       },
-      redirect: "follow",
+      redirect: "manual",
       timeout: 15000,
     });
-    if (!resp.ok) return res.status(resp.status).end();
-    let xml = await resp.text();
+    if ([301, 302, 303, 307, 308].includes(resp.status)) {
+      const location = resp.headers.get("location");
+      if (!location) throw new Error("Redirect without location header");
+      // Resolve relative redirects
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+    return resp;
+  }
+  throw new Error(`Too many redirects for: ${urlStr}`);
+}
+
+app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml", "/wp-sitemap*.xml"], async (req, res) => {
+  const mirrorHost = getMirrorHost(req);
+  try {
+    // Coba fetch dari origin utama, lalu fallback ke secure.komikid.org
+    const originUrls = [
+      `https://${ORIGIN_HOST}${req.path}`,
+      `https://secure.komikid.org${req.path}`,
+    ];
+
+    let xml = null;
+    for (const url of originUrls) {
+      try {
+        const resp = await fetchSitemapXml(url);
+        if (resp.ok) {
+          xml = await resp.text();
+          break;
+        }
+      } catch (e) {
+        console.error(`Sitemap fetch failed for ${url}: ${e.message}`);
+      }
+    }
+
+    if (!xml) return res.status(502).send("Sitemap unavailable");
+
     // Rewrite semua domain origin yang mungkin muncul di sitemap
     xml = xml.replace(buildOriginRegex(), `https://${mirrorHost}`);
     // Rewrite juga domain alternatif (secure.komikid.org, komikid.org, dll)
