@@ -863,8 +863,18 @@ app.all("*", async (req, res) => {
       html = html.replace(/<\/body>/i, `${bodyInjection}\n</body>`);
 
       // ==========================================================
-      // --- M. INJECT UNIQUE FOOTER CONTENT (ANTI-DUPLICATE) ---
+      // --- M. HAPUS FOOTER DUPLIKAT & INJECT UNIQUE FOOTER ---
       // ==========================================================
+      // Hapus semua footer original dari origin, simpan hanya satu
+      html = html.replace(
+        /(<footer[^>]*id=["']Footer["'][^>]*>[\s\S]*?<\/footer>\s*){2,}/gi,
+        (match) => {
+          // Ambil hanya footer pertama
+          const singleFooter = match.match(/<footer[^>]*id=["']Footer["'][^>]*>[\s\S]*?<\/footer>/i);
+          return singleFooter ? singleFooter[0] : match;
+        }
+      );
+
       // Tambahkan paragraf unik di footer yang mengandung konten berbeda
       // dari origin agar Google melihat halaman ini sebagai unik
       const uniqueFooterContent = `
