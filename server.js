@@ -82,7 +82,7 @@ Host: https://${mirrorHost}`
 // ============================================================
 // 0b. CUSTOM SITEMAP PROXY (rewrite origin → mirror)
 // ============================================================
-app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml"], async (req, res) => {
+app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml", "/wp-sitemap*.xml"], async (req, res) => {
   const mirrorHost = getMirrorHost(req);
   try {
     const originUrl = `https://${ORIGIN_HOST}${req.path}`;
@@ -169,8 +169,13 @@ app.all("*", async (req, res) => {
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get("location");
       if (location) {
-        const newLocation = location.replace(
+        let newLocation = location.replace(
           buildOriginRegex(),
+          `https://${mirrorHost}`
+        );
+        // Rewrite juga redirect ke komikid.org / secure.komikid.org
+        newLocation = newLocation.replace(
+          /https?:\/\/(www\.)?(secure\.)?komikid\.org/gi,
           `https://${mirrorHost}`
         );
         return res.redirect(response.status, newLocation);
