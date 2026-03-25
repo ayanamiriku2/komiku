@@ -290,6 +290,8 @@ app.all("*", async (req, res) => {
       html = html.replace(buildOriginRegex(), `https://${mirrorHost}`);
       // Rewrite juga domain alternatif (secure.komikid.org, komikid.org)
       html = html.replace(/https?:\/\/(www\.)?(secure\.)?komikid\.org/gi, `https://${mirrorHost}`);
+      // Rewrite plain-text domain origin (placeholder, title, dsb)
+      html = html.replace(new RegExp(`(["'])${escapeRegex(ORIGIN_HOST)}(["'])`, "gi"), `$1${mirrorHost}$2`);
 
       // --- B. HAPUS SEMUA CANONICAL LAMA & INJECT CANONICAL BARU ---
       html = html.replace(/<link[^>]*rel=["']canonical["'][^>]*\/?>/gi, "");
