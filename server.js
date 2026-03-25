@@ -17,9 +17,10 @@ app.set("trust proxy", true);
 // KONFIGURASI — Sesuaikan sebelum deploy
 // ============================================================
 const ORIGIN_HOST = process.env.ORIGIN_HOST || "komiku.org";
-const MIRROR_HOST = process.env.MIRROR_HOST || ""; // Kosongkan untuk auto-detect dari Host header
-const SITE_NAME = process.env.SITE_NAME || "KomikuMirror";
+const MIRROR_HOST = process.env.MIRROR_HOST || "komiku.io";
+const SITE_NAME = process.env.SITE_NAME || "Komiku";
 const SITE_TAGLINE = process.env.SITE_TAGLINE || "Baca Komik Manga Manhwa Manhua Bahasa Indonesia";
+const SITE_DESCRIPTION = process.env.SITE_DESCRIPTION || "Komiku.io — Situs baca komik manga, manhwa, dan manhua sub Indonesia terlengkap dan terupdate. Gratis tanpa iklan.";
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 
 // ============================================================
@@ -48,13 +49,32 @@ function uniquePageId(pathname) {
 }
 
 // ============================================================
-// MIDDLEWARE — SEO HEADERS
+// MIDDLEWARE — SECURITY & SEO HEADERS
 // ============================================================
 app.use((req, res, next) => {
   // Hapus header yang mengekspos origin
   res.removeHeader("x-powered-by");
   res.removeHeader("server");
+
+  // Security headers
+  res.set("X-Content-Type-Options", "nosniff");
+  res.set("X-Frame-Options", "SAMEORIGIN");
+  res.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+
+  // Force HTTPS di production
+  if (process.env.NODE_ENV === "production" && req.headers["x-forwarded-proto"] === "http") {
+    return res.redirect(301, `https://${req.get("host")}${req.originalUrl}`);
+  }
+
   next();
+});
+
+// ============================================================
+// HEALTH CHECK ENDPOINT (untuk Railway)
+// ============================================================
+app.get("/healthz", (req, res) => {
+  res.status(200).json({ status: "ok", timestamp: Date.now() });
 });
 
 // ============================================================
@@ -62,21 +82,43 @@ app.use((req, res, next) => {
 // ============================================================
 app.get("/robots.txt", (req, res) => {
   const mirrorHost = getMirrorHost(req);
-  res.type("text/plain").send(
+  res.type("text/plain")
+    .set("Cache-Control", "public, max-age=86400")
+    .send(
     `User-agent: *
 Allow: /
 Disallow: /wp-admin/
 Disallow: /wp-login.php
+Disallow: /wp-includes/
+Disallow: /wp-content/plugins/
 Disallow: /*?s=
 Disallow: /*?p=
 Disallow: /tag/
 Disallow: /feed/
+Disallow: /trackback/
+Disallow: /xmlrpc.php
+Disallow: /healthz
+
+User-agent: Googlebot
+Allow: /
+Allow: /manga/
+Allow: /manhua/
+Allow: /manhwa/
 
 Sitemap: https://${mirrorHost}/sitemap.xml
 Sitemap: https://${mirrorHost}/sitemap-index.xml
 
 Host: https://${mirrorHost}`
   );
+});
+
+// ============================================================
+// 0a. CUSTOM ADS.TXT (opsional, tambahkan konten jika diperlukan)
+// ============================================================
+app.get("/ads.txt", (req, res) => {
+  res.type("text/plain")
+    .set("Cache-Control", "public, max-age=86400")
+    .send("");
 });
 
 // ============================================================
@@ -357,30 +399,99 @@ app.all("*", async (req, res) => {
       // ==========================================================
       // --- J. INJECT SEO + ANTI-DUPLICATE HEAD TAGS ---
       // ==========================================================
+      // Deteksi tipe halaman untuk structured data
+      const isHomePage = reqPathname === "/" || reqPathname === "";
+      const isComicPage = /^\/manga\/|^\/manhua\/|^\/manhwa\/|^\/komik\//i.test(reqPathname);
+      const isChapterPage = /chapter|ch-/i.test(reqPathname);
+
+      // Extract page title untuk structured data
+      const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
+      const pageTitle = titleMatch ? titleMatch[1] : SITE_NAME;
+
+      // Breadcrumb structured data
+      const pathSegments = reqPathname.split("/").filter(Boolean);
+      const breadcrumbItems = [{ "@type": "ListItem", "position": 1, "name": "Beranda", "item": `https://${mirrorHost}/` }];
+      let breadcrumbPath = "";
+      for (let i = 0; i < pathSegments.length && i < 4; i++) {
+        breadcrumbPath += "/" + pathSegments[i];
+        breadcrumbItems.push({
+          "@type": "ListItem",
+          "position": i + 2,
+          "name": decodeURIComponent(pathSegments[i]).replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
+          "item": `https://${mirrorHost}${breadcrumbPath}/`
+        });
+      }
+
+      // Build structured data JSON-LD
+      const structuredDataArr = [
+        {
+          "@context": "https://schema.org",
+          "@type": "WebSite",
+          "name": SITE_NAME,
+          "alternateName": SITE_TAGLINE,
+          "url": `https://${mirrorHost}/`,
+          "description": SITE_DESCRIPTION,
+          "inLanguage": "id-ID",
+          "potentialAction": {
+            "@type": "SearchAction",
+            "target": `https://${mirrorHost}/?s={search_term_string}`,
+            "query-input": "required name=search_term_string"
+          }
+        }
+      ];
+
+      if (!isHomePage) {
+        structuredDataArr.push({
+          "@context": "https://schema.org",
+          "@type": "BreadcrumbList",
+          "itemListElement": breadcrumbItems
+        });
+      }
+
+      if (isComicPage && !isChapterPage) {
+        // Extract description dari meta tag yang sudah ada
+        const descMatch = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']*)["']/i);
+        const comicDesc = descMatch ? descMatch[1] : SITE_TAGLINE;
+        // Extract image dari og:image
+        const imgMatch = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']*)["']/i);
+        const comicImg = imgMatch ? imgMatch[1] : "";
+
+        structuredDataArr.push({
+          "@context": "https://schema.org",
+          "@type": "CreativeWork",
+          "name": pageTitle.replace(` - ${SITE_NAME}`, ""),
+          "url": canonicalUrl,
+          "description": comicDesc,
+          ...(comicImg && { "image": comicImg }),
+          "inLanguage": "id-ID",
+          "publisher": {
+            "@type": "Organization",
+            "name": SITE_NAME,
+            "url": `https://${mirrorHost}/`
+          }
+        });
+      }
+
+      const structuredDataScripts = structuredDataArr.map(d =>
+        `<script type="application/ld+json">${JSON.stringify(d)}</script>`
+      ).join("\n    ");
+
       const seoHeadInjection = `
     <link rel="canonical" href="${canonicalUrl}" />
     <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
-    <meta name="generator" content="${SITE_NAME} Mirror v1.0" />
     <meta name="copyright" content="${SITE_NAME}" />
     <meta name="identifier-url" content="${canonicalUrl}" />
+    <meta property="og:type" content="${isComicPage ? "article" : "website"}" />
     <meta property="og:site_name" content="${SITE_NAME} - ${SITE_TAGLINE}" />
+    <meta property="og:locale" content="id_ID" />
+    <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:site" content="@${SITE_NAME.toLowerCase()}" />
     <meta name="page-id" content="${pageId}" />
+    <meta name="theme-color" content="#3b5fd9" />
     <link rel="alternate" type="application/rss+xml" title="${SITE_NAME} RSS" href="https://${mirrorHost}/feed/" />
-    <script type="application/ld+json">
-    {
-      "@context": "https://schema.org",
-      "@type": "WebSite",
-      "name": "${SITE_NAME}",
-      "alternateName": "${SITE_TAGLINE}",
-      "url": "https://${mirrorHost}/",
-      "potentialAction": {
-        "@type": "SearchAction",
-        "target": "https://${mirrorHost}/?s={search_term_string}",
-        "query-input": "required name=search_term_string"
-      }
-    }
-    </script>`;
+    <link rel="alternate" hreflang="id" href="${canonicalUrl}" />
+    <link rel="alternate" hreflang="x-default" href="${canonicalUrl}" />
+    ${structuredDataScripts}`;
 
       html = html.replace(/<head([^>]*)>/i, `<head$1>\n${seoHeadInjection}`);
 
@@ -966,4 +1077,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ ${SITE_NAME} Mirror running on port ${PORT}`);
   console.log(`   Origin: ${ORIGIN_HOST}`);
   console.log(`   Mirror: ${MIRROR_HOST || "(auto-detect from Host header)"}`);
+  console.log(`   Env: ${process.env.NODE_ENV || "development"}`);
+  console.log(`   Health: http://0.0.0.0:${PORT}/healthz`);
 });
