@@ -208,6 +208,66 @@ app.get(["/sitemap.xml", "/sitemap-index.xml", "/sitemap*.xml", "/wp-sitemap*.xm
 });
 
 // ============================================================
+// ANALYTICS PROXY — Proxy requests to analytics.komiku.org
+// ============================================================
+app.all("/analytics-proxy/*", async (req, res) => {
+  const mirrorHost = getMirrorHost(req);
+  const apiPath = req.originalUrl.replace(/^\/analytics-proxy/, "");
+  const apiUrl = `https://analytics.${ORIGIN_HOST}${apiPath}`;
+
+  try {
+    const proxyHeaders = {
+      Host: `analytics.${ORIGIN_HOST}`,
+      "User-Agent": req.get("user-agent") || "Mozilla/5.0",
+      Accept: req.get("accept") || "*/*",
+      "Accept-Language": req.get("accept-language") || "id-ID,id;q=0.9",
+      "Accept-Encoding": "gzip, deflate",
+      Referer: `https://${ORIGIN_HOST}/`,
+      Origin: `https://${ORIGIN_HOST}`,
+    };
+
+    const fetchOptions = {
+      method: req.method,
+      headers: proxyHeaders,
+      redirect: "manual",
+      timeout: 30000,
+    };
+
+    if (["POST", "PUT", "PATCH"].includes(req.method)) {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      if (chunks.length > 0) fetchOptions.body = Buffer.concat(chunks);
+    }
+
+    const response = await fetch(apiUrl, fetchOptions);
+    const contentType = response.headers.get("content-type") || "";
+
+    for (const h of ["content-type", "last-modified", "etag"]) {
+      const val = response.headers.get(h);
+      if (val) res.set(h, val);
+    }
+    res.set("Cache-Control", "public, max-age=300, s-maxage=600");
+    res.set("Access-Control-Allow-Origin", `https://${mirrorHost}`);
+    res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set("Access-Control-Allow-Headers", "Content-Type");
+
+    if (req.method === "OPTIONS") return res.status(204).end();
+
+    if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript")) {
+      let body = await response.text();
+      body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
+      return res.status(response.status).send(body);
+    }
+
+    res.status(response.status);
+    response.body.pipe(res);
+  } catch (err) {
+    console.error("Analytics proxy error:", err.message, "URL:", apiUrl);
+    res.status(502).json({ error: "Analytics proxy failed" });
+  }
+});
+
+// ============================================================
 // API PROXY — Proxy requests to api.komiku.org to avoid CORS
 // ============================================================
 app.all("/api-proxy/*", async (req, res) => {
@@ -385,6 +445,8 @@ app.all("*", async (req, res) => {
       const pageId = uniquePageId(reqPathname);
 
       // --- A. REWRITE SEMUA URL ORIGIN → MIRROR ---
+      // A0. Rewrite analytics.komiku.org → mirror/analytics-proxy
+      html = html.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       // A1. Rewrite api.komiku.org → mirror/api-proxy (HARUS SEBELUM rewrite domain utama)
       html = html.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
       // A2. Rewrite domain utama
@@ -500,6 +562,22 @@ app.all("*", async (req, res) => {
       );
 
       // ==========================================================
+      // --- Ia. HAPUS DDOS-GUARD SCRIPTS ---
+      // ==========================================================
+      html = html.replace(
+        /<script[^>]*src=["'][^"']*ddos-guard[^"']*["'][^>]*>[\s\S]*?<\/script>/gi,
+        ""
+      );
+      html = html.replace(
+        /<script[^>]*>[\s\S]*?ddos-guard[\s\S]*?<\/script>/gi,
+        ""
+      );
+      html = html.replace(
+        /<script[^>]*src=["'][^"']*\.well-known[^"']*["'][^>]*>[\s\S]*?<\/script>/gi,
+        ""
+      );
+
+      // ==========================================================
       // --- J. INJECT SEO + ANTI-DUPLICATE HEAD TAGS ---
       // ==========================================================
       // Deteksi tipe halaman untuk structured data
@@ -596,7 +674,11 @@ app.all("*", async (req, res) => {
     <link rel="alternate" hreflang="x-default" href="${canonicalUrl}" />
     ${structuredDataScripts}`;
 
-      html = html.replace(/<head([^>]*)>/i, `<head$1>\n${seoHeadInjection}`);
+      // --- Inject jQuery CDN fallback (sebelum script lain) ---
+      const jqueryFallback = `
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js" integrity="sha512-v2CJ7UaYy4JwqLDIrZUI/4hqeoQieOmAZNXBeQyjo21dadnwR+8ZaIJVT8EE2ez9n99UhA2o/5cYakMYXeLMQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>`;
+
+      html = html.replace(/<head([^>]*)>/i, `<head$1>\n${seoHeadInjection}\n${jqueryFallback}`);
 
       // ==========================================================
       // --- K. INJECT CSS HIDE AUTH + MODERN THEME ---
@@ -1104,6 +1186,7 @@ app.all("*", async (req, res) => {
       // --- N. FINAL CLEANUP: hapus semua sisa referensi origin ---
       // ==========================================================
       // Pass terakhir untuk memastikan tidak ada URL origin tersisa di HTML
+      html = html.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       html = html.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
       html = html.replace(buildOriginRegex(), `https://${mirrorHost}`);
 
@@ -1140,6 +1223,7 @@ app.all("*", async (req, res) => {
       contentType.includes("application/json")
     ) {
       let body = await response.text();
+      body = body.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       body = body.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
       body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
       res.set("Content-Type", contentType);
