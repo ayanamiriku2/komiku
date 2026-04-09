@@ -11,6 +11,15 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { HttpsProxyAgent } = require("https-proxy-agent");
+const {
+  solveCfChallenge,
+  getCfCookies,
+  getCfUserAgent,
+  needsCfRefresh,
+  getCfProxy,
+  invalidateCfCookies,
+  hasCfCookies,
+} = require("./cf-solver");
 
 const app = express();
 app.use(compression());
@@ -442,6 +451,7 @@ app.get("/healthz", (req, res) => {
     proxy: { total: proxyList.length, directBlocked, lastWorkingProxy: !!lastWorkingProxy },
     origin: { primary: ORIGIN_HOST, current: currentWorkingOrigin, fallbacks: FALLBACK_ORIGINS },
     ddosGuardCookies: Object.keys(ddosGuardCookies).length,
+    cloudflare: { hasCookies: hasCfCookies(), needsRefresh: needsCfRefresh(), solvedViaProxy: !!getCfProxy() },
   });
 });
 
@@ -604,24 +614,82 @@ function setCachedImage(key, buffer, contentType) {
   imageCache.set(key, { buffer, contentType, ts: Date.now() });
 }
 
+// --- CF solver: auto-refresh trigger (debounced, non-blocking) ---
+let cfRefreshTimer = null;
+function triggerCfRefresh() {
+  if (cfRefreshTimer) return; // already scheduled
+  cfRefreshTimer = setTimeout(async () => {
+    cfRefreshTimer = null;
+    await solveCfForImages();
+  }, 3000); // 3s debounce
+}
+
+async function solveCfForImages() {
+  const target = `https://img.${ORIGIN_HOST}/`;
+  console.log("🔄 Attempting Cloudflare solve for image CDN...");
+
+  // Try direct first
+  let result = await solveCfChallenge(target);
+  if (result && result.cookies) return result;
+
+  // Try through proxies (proxyList entries are already http://user:pass@host:port)
+  for (let i = 0; i < Math.min(3, proxyList.length); i++) {
+    const proxyUrl = proxyList[i];
+    if (!proxyUrl) continue;
+    console.log(`   Trying through proxy ${i + 1}...`);
+    result = await solveCfChallenge(target, proxyUrl);
+    if (result && result.cookies) return result;
+  }
+
+  console.warn("⚠️ Could not solve Cloudflare challenge for images (will retry later)");
+  return null;
+}
+
 // Helper: fast direct image fetch with content-type validation (no DDoS-Guard logic)
 async function fetchImageDirect(url, headers, agent, timeout = 8000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
+    // Inject Cloudflare cookies if available
+    if (hasCfCookies()) {
+      const cfUA = getCfUserAgent();
+      if (cfUA) headers["User-Agent"] = cfUA;
+      headers["Cookie"] = getCfCookies();
+    }
     const opts = { headers, redirect: "follow", signal: controller.signal };
     if (agent) opts.agent = agent;
+    // If CF was solved through a specific proxy, prefer that proxy for image requests
+    if (!agent && hasCfCookies() && getCfProxy()) {
+      const proxyAgent = getProxyAgent(getCfProxy());
+      if (proxyAgent) opts.agent = proxyAgent;
+    }
     const response = await fetch(url, opts);
     clearTimeout(timer);
     if (!response.ok) {
-      try { await response.text(); } catch (_) {}
+      // Detect Cloudflare block → invalidate cookies for re-solve
+      if (response.status === 403) {
+        const body = await response.text().catch(() => "");
+        if (body.includes("cloudflare") || body.includes("cf-") || body.includes("Attention Required")) {
+          console.warn("⛔ Cloudflare blocked image request, invalidating cookies...");
+          invalidateCfCookies();
+          triggerCfRefresh();
+        }
+      } else {
+        try { await response.text(); } catch (_) {}
+      }
       return null;
     }
     // CRITICAL: Validate response is actually an image, not an HTML challenge page
     const ct = response.headers.get("content-type") || "";
     if (ct.includes("text/html") || ct.includes("text/plain") || ct.includes("text/xml")) {
       console.warn(`⚠️ Image URL returned ${ct} instead of image: ${url}`);
-      try { await response.text(); } catch (_) {}
+      const body = await response.text().catch(() => "");
+      // Detect Cloudflare challenge in 200 response
+      if (body.includes("cloudflare") || body.includes("cf-")) {
+        console.warn("⛔ Cloudflare challenge detected in image response, invalidating cookies...");
+        invalidateCfCookies();
+        triggerCfRefresh();
+      }
       return null;
     }
     return response;
@@ -2233,4 +2301,26 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`   Cache: max ${CACHE_MAX_ENTRIES} entries, HTML ${CACHE_TTL_HTML / 1000}s / Asset ${CACHE_TTL_ASSET / 1000}s / Image ${CACHE_TTL_IMAGE / 1000}s`);
   console.log(`   Strategy: direct-first → last-working-proxy → rotate → fallback origins`);
   console.log(`   Health: http://0.0.0.0:${PORT}/healthz`);
+
+  // --- Cloudflare solver: initial solve + periodic refresh ---
+  console.log("🔓 Starting Cloudflare solver for image CDN...");
+  solveCfForImages().then((result) => {
+    if (result) {
+      console.log("✅ Cloudflare image CDN cookies ready");
+    } else {
+      console.warn("⚠️ Initial CF solve failed, will retry periodically");
+    }
+  }).catch((err) => {
+    console.error("❌ CF solver startup error:", err.message);
+  });
+
+  // Periodic refresh every 12 minutes
+  setInterval(() => {
+    if (needsCfRefresh()) {
+      console.log("🔄 Periodic CF cookie refresh...");
+      solveCfForImages().catch((err) => {
+        console.error("❌ CF periodic refresh error:", err.message);
+      });
+    }
+  }, 3 * 60 * 1000); // check every 3 minutes, only solve if expired
 });
