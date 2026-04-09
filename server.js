@@ -910,7 +910,7 @@ app.all("/plus-proxy/*", async (req, res) => {
     res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
 
     if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript")) {
-      let body = await response.text();
+      let body = response._preReadBody || await response.text();
       body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
       body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
@@ -918,6 +918,9 @@ app.all("/plus-proxy/*", async (req, res) => {
       return res.status(response.status).send(body);
     }
 
+    if (response._preReadBody) {
+      return res.status(response.status).send(response._preReadBody);
+    }
     res.status(response.status);
     response.body.pipe(res);
   } catch (err) {
@@ -998,11 +1001,14 @@ app.all("/analytics-proxy/*", async (req, res) => {
     if (req.method === "OPTIONS") return res.status(204).end();
 
     if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript")) {
-      let body = await response.text();
+      let body = response._preReadBody || await response.text();
       body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
       return res.status(response.status).send(body);
     }
 
+    if (response._preReadBody) {
+      return res.status(response.status).send(response._preReadBody);
+    }
     res.status(response.status);
     response.body.pipe(res);
   } catch (err) {
@@ -1077,7 +1083,7 @@ app.all("/api-proxy/*", async (req, res) => {
 
     // Text-based responses: rewrite origin URLs
     if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript")) {
-      let body = await response.text();
+      let body = response._preReadBody || await response.text();
       body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
       body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
@@ -1087,6 +1093,9 @@ app.all("/api-proxy/*", async (req, res) => {
     }
 
     // Binary responses: stream through
+    if (response._preReadBody) {
+      return res.status(response.status).send(response._preReadBody);
+    }
     res.status(response.status);
     response.body.pipe(res);
   } catch (err) {
@@ -2090,7 +2099,7 @@ app.all("*", async (req, res) => {
     // 3B. PROSES CSS
     // ============================
     if (contentType.includes("text/css")) {
-      let css = await response.text();
+      let css = response._preReadBody || await response.text();
       css = css.replace(buildOriginRegex(), `https://${mirrorHost}`);
       res.set("Content-Type", "text/css; charset=utf-8");
       res.set("Cache-Control", "public, max-age=604800, s-maxage=2592000");
@@ -2115,7 +2124,7 @@ app.all("*", async (req, res) => {
       contentType.includes("javascript") ||
       contentType.includes("application/json")
     ) {
-      let body = await response.text();
+      let body = response._preReadBody || await response.text();
       body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
       body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
@@ -2147,7 +2156,7 @@ app.all("*", async (req, res) => {
       contentType.includes("application/rss+xml") ||
       contentType.includes("application/atom+xml")
     ) {
-      let xml = await response.text();
+      let xml = response._preReadBody || await response.text();
       xml = xml.replace(buildOriginRegex(), `https://${mirrorHost}`);
       res.set("Content-Type", contentType);
       res.set("Cache-Control", "public, max-age=3600");
@@ -2158,6 +2167,9 @@ app.all("*", async (req, res) => {
     // 3E. ASSET LAINNYA (images, fonts, etc) — stream through
     // ============================
     res.set("Cache-Control", "public, max-age=2592000, s-maxage=2592000");
+    if (response._preReadBody) {
+      return res.status(response.status).send(response._preReadBody);
+    }
     res.status(response.status);
     response.body.pipe(res);
   } catch (err) {
