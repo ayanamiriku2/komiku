@@ -15,10 +15,16 @@ const cfStore = {
   lastSolved: 0,
   solving: false,
   solvedProxy: null,  // proxy URL used during solve (cookies bound to that IP)
+  // --- Cooldown / backoff tracking ---
+  lastFailure: 0,           // timestamp of last failed solve
+  consecutiveFailures: 0,   // how many solves have failed in a row
+  cooldownUntil: 0,         // don't attempt solve until this timestamp
 };
 
 const CF_SOLVE_INTERVAL = 12 * 60 * 1000;  // refresh every 12 minutes
 const CF_SOLVE_TIMEOUT  = 50000;            // 50s max to solve challenge
+const CF_MIN_COOLDOWN   = 2 * 60 * 1000;   // 2 minutes min cooldown after failure
+const CF_MAX_COOLDOWN   = 30 * 60 * 1000;  // 30 minutes max cooldown
 
 // Anti-detection Chrome flags (from botasaurus page.ts)
 const CHROME_FLAGS = [
@@ -50,6 +56,13 @@ const CHROME_FLAGS = [
  * @returns {object|null} - { cookies, userAgent } or null on failure
  */
 async function solveCfChallenge(targetUrl, proxyUrl = null) {
+  // Check cooldown — don't retry if we recently failed
+  if (Date.now() < cfStore.cooldownUntil) {
+    const remaining = Math.round((cfStore.cooldownUntil - Date.now()) / 1000);
+    console.log(`⏳ CF solve on cooldown, ${remaining}s remaining (${cfStore.consecutiveFailures} consecutive failures)`);
+    return cfStore.cookies ? cfStore : null;
+  }
+
   // Prevent concurrent solves
   if (cfStore.solving) {
     let waited = 0;
@@ -165,9 +178,25 @@ async function solveCfChallenge(targetUrl, proxyUrl = null) {
       console.log(`   CF cookies: ${cfSpecific.map((c) => c.name).join(", ")}`);
     }
 
+    // Reset failure tracking on success
+    cfStore.consecutiveFailures = 0;
+    cfStore.lastFailure = 0;
+    cfStore.cooldownUntil = 0;
+
     return cfStore;
   } catch (err) {
     console.error(`❌ CF solve failed: ${err.message}`);
+
+    // Track failure and set exponential cooldown
+    cfStore.consecutiveFailures++;
+    cfStore.lastFailure = Date.now();
+    const backoff = Math.min(
+      CF_MIN_COOLDOWN * Math.pow(2, cfStore.consecutiveFailures - 1),
+      CF_MAX_COOLDOWN
+    );
+    cfStore.cooldownUntil = Date.now() + backoff;
+    console.log(`⏳ CF solve cooldown set to ${Math.round(backoff / 1000)}s after ${cfStore.consecutiveFailures} failures`);
+
     return null;
   } finally {
     if (browser) {
@@ -198,8 +227,10 @@ function getCfProxy() {
   return cfStore.solvedProxy;
 }
 
-/** Invalidate cookies to force re-solve */
+/** Invalidate cookies to force re-solve (respects cooldown) */
 function invalidateCfCookies() {
+  // Don't spam invalidations — if already invalid or on cooldown, skip
+  if (!cfStore.cookies && !cfStore.lastSolved) return;
   cfStore.cookies = "";
   cfStore.cookieMap = {};
   cfStore.lastSolved = 0;
@@ -209,6 +240,17 @@ function invalidateCfCookies() {
 /** Check if CF cookies are currently available */
 function hasCfCookies() {
   return !!cfStore.cookies && !!cfStore.lastSolved;
+}
+
+/** Check if CF solver is on cooldown (no point retrying) */
+function isCfOnCooldown() {
+  return Date.now() < cfStore.cooldownUntil;
+}
+
+/** Get cooldown remaining in seconds */
+function getCfCooldownRemaining() {
+  if (Date.now() >= cfStore.cooldownUntil) return 0;
+  return Math.round((cfStore.cooldownUntil - Date.now()) / 1000);
 }
 
 function sleep(ms) {
@@ -223,4 +265,6 @@ module.exports = {
   getCfProxy,
   invalidateCfCookies,
   hasCfCookies,
+  isCfOnCooldown,
+  getCfCooldownRemaining,
 };

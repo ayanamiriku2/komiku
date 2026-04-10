@@ -19,6 +19,8 @@ const {
   getCfProxy,
   invalidateCfCookies,
   hasCfCookies,
+  isCfOnCooldown,
+  getCfCooldownRemaining,
 } = require("./cf-solver");
 
 const app = express();
@@ -451,7 +453,7 @@ app.get("/healthz", (req, res) => {
     proxy: { total: proxyList.length, directBlocked, lastWorkingProxy: !!lastWorkingProxy },
     origin: { primary: ORIGIN_HOST, current: currentWorkingOrigin, fallbacks: FALLBACK_ORIGINS },
     ddosGuardCookies: Object.keys(ddosGuardCookies).length,
-    cloudflare: { hasCookies: hasCfCookies(), needsRefresh: needsCfRefresh(), solvedViaProxy: !!getCfProxy() },
+    cloudflare: { hasCookies: hasCfCookies(), needsRefresh: needsCfRefresh(), solvedViaProxy: !!getCfProxy(), onCooldown: isCfOnCooldown(), cooldownRemaining: getCfCooldownRemaining() },
   });
 });
 
@@ -596,6 +598,31 @@ const IMAGE_CACHE_MAX = parseInt(process.env.IMAGE_CACHE_MAX, 10) || 200;
 const IMAGE_CACHE_TTL = parseInt(process.env.IMAGE_CACHE_TTL, 10) || 600 * 1000; // 10 min
 const imageCache = new Map();
 
+// --- Concurrent image fetch limiter (prevent resource exhaustion) ---
+const MAX_CONCURRENT_IMAGE_FETCHES = parseInt(process.env.MAX_CONCURRENT_IMAGE_FETCHES, 10) || 10;
+let activeImageFetches = 0;
+const imageQueue = [];
+
+function acquireImageSlot() {
+  return new Promise((resolve) => {
+    if (activeImageFetches < MAX_CONCURRENT_IMAGE_FETCHES) {
+      activeImageFetches++;
+      resolve();
+    } else {
+      imageQueue.push(resolve);
+    }
+  });
+}
+
+function releaseImageSlot() {
+  if (imageQueue.length > 0) {
+    const next = imageQueue.shift();
+    next();
+  } else {
+    activeImageFetches--;
+  }
+}
+
 function getCachedImage(key) {
   const entry = imageCache.get(key);
   if (!entry) return null;
@@ -614,17 +641,28 @@ function setCachedImage(key, buffer, contentType) {
   imageCache.set(key, { buffer, contentType, ts: Date.now() });
 }
 
-// --- CF solver: auto-refresh trigger (debounced, non-blocking) ---
+// --- CF solver: auto-refresh trigger (debounced, non-blocking, respects cooldown) ---
 let cfRefreshTimer = null;
 function triggerCfRefresh() {
+  // Don't trigger if on cooldown (Chromium can't fork, etc.)
+  if (isCfOnCooldown()) {
+    return;
+  }
   if (cfRefreshTimer) return; // already scheduled
   cfRefreshTimer = setTimeout(async () => {
     cfRefreshTimer = null;
+    if (isCfOnCooldown()) return; // re-check before solve
     await solveCfForImages();
-  }, 3000); // 3s debounce
+  }, 5000); // 5s debounce (increased from 3s)
 }
 
 async function solveCfForImages() {
+  // Don't attempt if on cooldown
+  if (isCfOnCooldown()) {
+    console.log(`⏳ CF solve skipped — on cooldown (${getCfCooldownRemaining()}s remaining)`);
+    return null;
+  }
+
   const target = `https://img.${ORIGIN_HOST}/`;
   console.log("🔄 Attempting Cloudflare solve for image CDN...");
 
@@ -632,8 +670,12 @@ async function solveCfForImages() {
   let result = await solveCfChallenge(target);
   if (result && result.cookies) return result;
 
-  // Try through proxies (proxyList entries are already http://user:pass@host:port)
-  for (let i = 0; i < Math.min(3, proxyList.length); i++) {
+  // If we entered cooldown after that failure, stop
+  if (isCfOnCooldown()) return null;
+
+  // Try through proxies (limit to 2 to save resources)
+  for (let i = 0; i < Math.min(2, proxyList.length); i++) {
+    if (isCfOnCooldown()) return null;
     const proxyUrl = proxyList[i];
     if (!proxyUrl) continue;
     console.log(`   Trying through proxy ${i + 1}...`);
@@ -641,9 +683,15 @@ async function solveCfForImages() {
     if (result && result.cookies) return result;
   }
 
-  console.warn("⚠️ Could not solve Cloudflare challenge for images (will retry later)");
+  console.warn("⚠️ Could not solve Cloudflare challenge for images — using external fallbacks");
   return null;
 }
+
+// --- Track Cloudflare 403 hits to avoid spamming invalidation ---
+let cfBlockCount = 0;
+let lastCfBlockTime = 0;
+const CF_BLOCK_INVALIDATE_THRESHOLD = 3; // only invalidate after N blocks
+const CF_BLOCK_WINDOW = 30000; // within 30s window
 
 // Helper: fast direct image fetch with content-type validation (no DDoS-Guard logic)
 async function fetchImageDirect(url, headers, agent, timeout = 8000) {
@@ -666,13 +714,25 @@ async function fetchImageDirect(url, headers, agent, timeout = 8000) {
     const response = await fetch(url, opts);
     clearTimeout(timer);
     if (!response.ok) {
-      // Detect Cloudflare block → invalidate cookies for re-solve
+      // Detect Cloudflare block — don't invalidate on every single 403
       if (response.status === 403) {
         const body = await response.text().catch(() => "");
         if (body.includes("cloudflare") || body.includes("cf-") || body.includes("Attention Required")) {
-          console.warn("⛔ Cloudflare blocked image request, invalidating cookies...");
-          invalidateCfCookies();
-          triggerCfRefresh();
+          const now = Date.now();
+          // Reset counter if outside window
+          if (now - lastCfBlockTime > CF_BLOCK_WINDOW) {
+            cfBlockCount = 0;
+          }
+          cfBlockCount++;
+          lastCfBlockTime = now;
+
+          // Only invalidate + trigger refresh after threshold, and not on cooldown
+          if (cfBlockCount >= CF_BLOCK_INVALIDATE_THRESHOLD && !isCfOnCooldown()) {
+            console.warn(`⛔ Cloudflare blocked ${cfBlockCount} image requests, invalidating cookies...`);
+            invalidateCfCookies();
+            triggerCfRefresh();
+            cfBlockCount = 0;
+          }
         }
       } else {
         try { await response.text(); } catch (_) {}
@@ -682,13 +742,19 @@ async function fetchImageDirect(url, headers, agent, timeout = 8000) {
     // CRITICAL: Validate response is actually an image, not an HTML challenge page
     const ct = response.headers.get("content-type") || "";
     if (ct.includes("text/html") || ct.includes("text/plain") || ct.includes("text/xml")) {
-      console.warn(`⚠️ Image URL returned ${ct} instead of image: ${url}`);
       const body = await response.text().catch(() => "");
-      // Detect Cloudflare challenge in 200 response
+      // Detect Cloudflare challenge in 200 response — same throttled approach
       if (body.includes("cloudflare") || body.includes("cf-")) {
-        console.warn("⛔ Cloudflare challenge detected in image response, invalidating cookies...");
-        invalidateCfCookies();
-        triggerCfRefresh();
+        const now = Date.now();
+        if (now - lastCfBlockTime > CF_BLOCK_WINDOW) cfBlockCount = 0;
+        cfBlockCount++;
+        lastCfBlockTime = now;
+        if (cfBlockCount >= CF_BLOCK_INVALIDATE_THRESHOLD && !isCfOnCooldown()) {
+          console.warn(`⛔ Cloudflare challenge in image response (${cfBlockCount} hits), invalidating cookies...`);
+          invalidateCfCookies();
+          triggerCfRefresh();
+          cfBlockCount = 0;
+        }
       }
       return null;
     }
@@ -699,7 +765,7 @@ async function fetchImageDirect(url, headers, agent, timeout = 8000) {
   }
 }
 
-// Helper: try fetching image from multiple hosts with fast direct fetch + proxy + wsrv.nl fallback
+// Helper: try fetching image from multiple hosts with fast direct fetch + proxy + external fallbacks
 async function fetchImageWithRetry(imgUrl, hostHeader) {
   const parsedUrl = new URL(imgUrl);
   const imgPath = parsedUrl.pathname + parsedUrl.search;
@@ -725,10 +791,16 @@ async function fetchImageWithRetry(imgUrl, hostHeader) {
     },
   ];
 
-  // === ATTEMPT 1: Direct fetch (fastest) ===
-  for (const headers of headerSets) {
-    const response = await fetchImageDirect(imgUrl, headers, undefined, 8000);
-    if (response) return response;
+  // If CF solver is on cooldown or has no cookies, skip direct attempts
+  // and go straight to proxy/external fallbacks to save time
+  const cfAvailable = hasCfCookies() && !isCfOnCooldown();
+
+  // === ATTEMPT 1: Direct fetch (only if CF cookies available or not CF-protected) ===
+  if (cfAvailable) {
+    for (const headers of headerSets) {
+      const response = await fetchImageDirect(imgUrl, { ...headers }, undefined, 8000);
+      if (response) return response;
+    }
   }
 
   // === ATTEMPT 2: Through proxy (if available) ===
@@ -736,25 +808,44 @@ async function fetchImageWithRetry(imgUrl, hostHeader) {
     const proxyUrl = lastWorkingProxy || getNextProxy();
     if (proxyUrl) {
       const agent = getProxyAgent(proxyUrl);
-      const response = await fetchImageDirect(imgUrl, headerSets[0], agent, 10000);
+      const response = await fetchImageDirect(imgUrl, { ...headerSets[0] }, agent, 10000);
       if (response) {
         lastWorkingProxy = proxyUrl;
         return response;
       }
     }
+    // Try one more proxy if first failed
+    if (proxyList.length > 1) {
+      const proxyUrl2 = getNextProxy();
+      if (proxyUrl2) {
+        const agent2 = getProxyAgent(proxyUrl2);
+        const response = await fetchImageDirect(imgUrl, { ...headerSets[0] }, agent2, 10000);
+        if (response) {
+          lastWorkingProxy = proxyUrl2;
+          return response;
+        }
+      }
+    }
   }
 
-  // === ATTEMPT 3: Try via wsrv.nl external image CDN (bypasses Cloudflare/DDoS-Guard) ===
+  // === ATTEMPT 3: wsrv.nl external image CDN (bypasses Cloudflare) ===
   try {
-    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&default=placeholder`;
+    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&n=-1`;
     const response = await fetchImageDirect(wsrvUrl, {
       "User-Agent": IMAGE_UA,
       Accept: "image/*,*/*;q=0.8",
-    }, undefined, 10000);
-    if (response) {
-      console.log(`✅ wsrv.nl fallback worked for: ${imgUrl}`);
-      return response;
-    }
+    }, undefined, 12000);
+    if (response) return response;
+  } catch (_) {}
+
+  // === ATTEMPT 4: images.weserv.nl (alternative endpoint) ===
+  try {
+    const weservUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imgUrl)}&n=-1`;
+    const response = await fetchImageDirect(weservUrl, {
+      "User-Agent": IMAGE_UA,
+      Accept: "image/*,*/*;q=0.8",
+    }, undefined, 12000);
+    if (response) return response;
   } catch (_) {}
 
   return null;
@@ -776,14 +867,18 @@ app.get("/img-proxy/*", async (req, res) => {
     return res.status(200).send(cached.buffer);
   }
 
+  // Concurrency limit
+  await acquireImageSlot();
+
   try {
+    // When CF is on cooldown, skip hosts that need CF (img.komiku.org)
+    // and rely on proxy + external fallbacks which fetchImageWithRetry handles
+    const cfOnCooldown = isCfOnCooldown();
+
     // Try primary host first, then fallbacks
-    const imgHosts = [
-      `img.${ORIGIN_HOST}`,
-      `cdn.${ORIGIN_HOST}`,
-      `thumbnail.${ORIGIN_HOST}`,
-      ORIGIN_HOST,
-    ];
+    const imgHosts = cfOnCooldown
+      ? [`cdn.${ORIGIN_HOST}`, ORIGIN_HOST]  // skip img.* when CF is down
+      : [`img.${ORIGIN_HOST}`, `cdn.${ORIGIN_HOST}`, `thumbnail.${ORIGIN_HOST}`, ORIGIN_HOST];
 
     let response = null;
     for (const imgHost of imgHosts) {
@@ -792,19 +887,13 @@ app.get("/img-proxy/*", async (req, res) => {
       if (response) break;
     }
 
-    if (!response) {
-      // Last resort: wsrv.nl with primary URL
-      try {
-        const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&default=placeholder`;
-        response = await fetchImageDirect(wsrvUrl, {
-          "User-Agent": IMAGE_UA,
-          Accept: "image/*,*/*;q=0.8",
-        }, undefined, 12000);
-      } catch (_) {}
+    // If CF-protected hosts failed, try img.* through external CDN directly
+    if (!response && cfOnCooldown) {
+      response = await fetchImageWithRetry(imgUrl, `img.${ORIGIN_HOST}`);
     }
 
     if (!response) {
-      return res.status(502).set("Cache-Control", "no-cache").end();
+      return res.status(502).set("Cache-Control", "no-cache, no-store").end();
     }
 
     const contentType = response.headers.get("content-type") || "image/jpeg";
@@ -837,6 +926,8 @@ app.get("/img-proxy/*", async (req, res) => {
   } catch (err) {
     console.error("Image proxy error:", err.message, "URL:", imgUrl);
     res.status(502).set("Cache-Control", "no-cache").end();
+  } finally {
+    releaseImageSlot();
   }
 });
 
@@ -858,13 +949,14 @@ app.get("/thumb-proxy/*", async (req, res) => {
     return res.status(200).send(cached.buffer);
   }
 
+  // Concurrency limit
+  await acquireImageSlot();
+
   // Try multiple thumbnail hosts in case primary is blocked
-  const thumbHosts = [
-    `thumbnail.${ORIGIN_HOST}`,
-    `cdn.${ORIGIN_HOST}`,
-    `img.${ORIGIN_HOST}`,
-    ORIGIN_HOST,
-  ];
+  const cfOnCooldown = isCfOnCooldown();
+  const thumbHosts = cfOnCooldown
+    ? [`cdn.${ORIGIN_HOST}`, ORIGIN_HOST]
+    : [`thumbnail.${ORIGIN_HOST}`, `cdn.${ORIGIN_HOST}`, `img.${ORIGIN_HOST}`, ORIGIN_HOST];
 
   try {
     let response = null;
@@ -874,20 +966,14 @@ app.get("/thumb-proxy/*", async (req, res) => {
       if (response) break;
     }
 
-    if (!response) {
-      // Last resort: try wsrv.nl with the primary thumbnail URL
+    // If all direct hosts failed, let fetchImageWithRetry try via external CDN
+    if (!response && cfOnCooldown) {
       const primaryUrl = `https://thumbnail.${ORIGIN_HOST}${imgPath}`;
-      try {
-        const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(primaryUrl)}&default=placeholder`;
-        response = await fetchImageDirect(wsrvUrl, {
-          "User-Agent": IMAGE_UA,
-          Accept: "image/*,*/*;q=0.8",
-        }, undefined, 12000);
-      } catch (_) {}
+      response = await fetchImageWithRetry(primaryUrl, `thumbnail.${ORIGIN_HOST}`);
     }
 
     if (!response) {
-      return res.status(502).set("Cache-Control", "no-cache").end();
+      return res.status(502).set("Cache-Control", "no-cache, no-store").end();
     }
 
     const contentType = response.headers.get("content-type") || "image/jpeg";
@@ -921,6 +1007,8 @@ app.get("/thumb-proxy/*", async (req, res) => {
   } catch (err) {
     console.error("Thumbnail proxy error:", err.message, "URL:", imgPath);
     res.status(502).set("Cache-Control", "no-cache").end();
+  } finally {
+    releaseImageSlot();
   }
 });
 
