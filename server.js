@@ -641,49 +641,17 @@ function setCachedImage(key, buffer, contentType) {
   imageCache.set(key, { buffer, contentType, ts: Date.now() });
 }
 
-// --- CF solver: auto-refresh trigger (debounced, non-blocking, respects cooldown) ---
-let cfRefreshTimer = null;
+// --- CF solver: DISABLED (Puppeteer too heavy for Railway, CF blocks with "Attention Required") ---
+// Images are served via wsrv.nl / weserv.nl external CDN fallback instead.
 function triggerCfRefresh() {
-  // Don't trigger if on cooldown (Chromium can't fork, etc.)
-  if (isCfOnCooldown()) {
-    return;
-  }
-  if (cfRefreshTimer) return; // already scheduled
-  cfRefreshTimer = setTimeout(async () => {
-    cfRefreshTimer = null;
-    if (isCfOnCooldown()) return; // re-check before solve
-    await solveCfForImages();
-  }, 5000); // 5s debounce (increased from 3s)
+  // no-op: CF solver disabled, relying on external image CDN fallback
 }
 
 async function solveCfForImages() {
-  // Don't attempt if on cooldown
-  if (isCfOnCooldown()) {
-    console.log(`⏳ CF solve skipped — on cooldown (${getCfCooldownRemaining()}s remaining)`);
-    return null;
-  }
-
-  const target = `https://img.${ORIGIN_HOST}/`;
-  console.log("🔄 Attempting Cloudflare solve for image CDN...");
-
-  // Try direct first
-  let result = await solveCfChallenge(target);
-  if (result && result.cookies) return result;
-
-  // If we entered cooldown after that failure, stop
-  if (isCfOnCooldown()) return null;
-
-  // Try through proxies (limit to 2 to save resources)
-  for (let i = 0; i < Math.min(2, proxyList.length); i++) {
-    if (isCfOnCooldown()) return null;
-    const proxyUrl = proxyList[i];
-    if (!proxyUrl) continue;
-    console.log(`   Trying through proxy ${i + 1}...`);
-    result = await solveCfChallenge(target, proxyUrl);
-    if (result && result.cookies) return result;
-  }
-
-  console.warn("⚠️ Could not solve Cloudflare challenge for images — using external fallbacks");
+  // Disabled: Puppeteer can't solve "Attention Required" pages and
+  // consumes too many resources (Cannot fork errors on Railway).
+  // All images are proxied through wsrv.nl / weserv.nl instead.
+  console.log("ℹ️ CF solver disabled — using wsrv.nl/weserv.nl for image CDN");
   return null;
 }
 
@@ -765,12 +733,12 @@ async function fetchImageDirect(url, headers, agent, timeout = 8000) {
   }
 }
 
-// Helper: try fetching image from multiple hosts with fast direct fetch + proxy + external fallbacks
+// Helper: try fetching image — wsrv.nl FIRST (since CF blocks direct), then proxy, then direct
 async function fetchImageWithRetry(imgUrl, hostHeader) {
   const parsedUrl = new URL(imgUrl);
   const imgPath = parsedUrl.pathname + parsedUrl.search;
 
-  // Header sets to try (from most to least specific)
+  // Header sets for direct/proxy attempts
   const headerSets = [
     {
       Host: hostHeader,
@@ -791,19 +759,27 @@ async function fetchImageWithRetry(imgUrl, hostHeader) {
     },
   ];
 
-  // If CF solver is on cooldown or has no cookies, skip direct attempts
-  // and go straight to proxy/external fallbacks to save time
-  const cfAvailable = hasCfCookies() && !isCfOnCooldown();
+  // === ATTEMPT 1: wsrv.nl (fastest — bypasses Cloudflare entirely) ===
+  try {
+    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&n=-1`;
+    const response = await fetchImageDirect(wsrvUrl, {
+      "User-Agent": IMAGE_UA,
+      Accept: "image/*,*/*;q=0.8",
+    }, undefined, 10000);
+    if (response) return response;
+  } catch (_) {}
 
-  // === ATTEMPT 1: Direct fetch (only if CF cookies available or not CF-protected) ===
-  if (cfAvailable) {
-    for (const headers of headerSets) {
-      const response = await fetchImageDirect(imgUrl, { ...headers }, undefined, 8000);
-      if (response) return response;
-    }
-  }
+  // === ATTEMPT 2: images.weserv.nl (alternative wsrv endpoint) ===
+  try {
+    const weservUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imgUrl)}&n=-1`;
+    const response = await fetchImageDirect(weservUrl, {
+      "User-Agent": IMAGE_UA,
+      Accept: "image/*,*/*;q=0.8",
+    }, undefined, 10000);
+    if (response) return response;
+  } catch (_) {}
 
-  // === ATTEMPT 2: Through proxy (if available) ===
+  // === ATTEMPT 3: Through proxy (if available) ===
   if (proxyList.length > 0) {
     const proxyUrl = lastWorkingProxy || getNextProxy();
     if (proxyUrl) {
@@ -814,39 +790,16 @@ async function fetchImageWithRetry(imgUrl, hostHeader) {
         return response;
       }
     }
-    // Try one more proxy if first failed
-    if (proxyList.length > 1) {
-      const proxyUrl2 = getNextProxy();
-      if (proxyUrl2) {
-        const agent2 = getProxyAgent(proxyUrl2);
-        const response = await fetchImageDirect(imgUrl, { ...headerSets[0] }, agent2, 10000);
-        if (response) {
-          lastWorkingProxy = proxyUrl2;
-          return response;
-        }
-      }
-    }
   }
 
-  // === ATTEMPT 3: wsrv.nl external image CDN (bypasses Cloudflare) ===
-  try {
-    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&n=-1`;
-    const response = await fetchImageDirect(wsrvUrl, {
-      "User-Agent": IMAGE_UA,
-      Accept: "image/*,*/*;q=0.8",
-    }, undefined, 12000);
-    if (response) return response;
-  } catch (_) {}
-
-  // === ATTEMPT 4: images.weserv.nl (alternative endpoint) ===
-  try {
-    const weservUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imgUrl)}&n=-1`;
-    const response = await fetchImageDirect(weservUrl, {
-      "User-Agent": IMAGE_UA,
-      Accept: "image/*,*/*;q=0.8",
-    }, undefined, 12000);
-    if (response) return response;
-  } catch (_) {}
+  // === ATTEMPT 4: Direct fetch (last resort — usually blocked by CF) ===
+  const cfAvailable = hasCfCookies() && !isCfOnCooldown();
+  if (cfAvailable) {
+    for (const headers of headerSets) {
+      const response = await fetchImageDirect(imgUrl, { ...headers }, undefined, 8000);
+      if (response) return response;
+    }
+  }
 
   return null;
 }
@@ -871,25 +824,14 @@ app.get("/img-proxy/*", async (req, res) => {
   await acquireImageSlot();
 
   try {
-    // When CF is on cooldown, skip hosts that need CF (img.komiku.org)
-    // and rely on proxy + external fallbacks which fetchImageWithRetry handles
-    const cfOnCooldown = isCfOnCooldown();
-
-    // Try primary host first, then fallbacks
-    const imgHosts = cfOnCooldown
-      ? [`cdn.${ORIGIN_HOST}`, ORIGIN_HOST]  // skip img.* when CF is down
-      : [`img.${ORIGIN_HOST}`, `cdn.${ORIGIN_HOST}`, `thumbnail.${ORIGIN_HOST}`, ORIGIN_HOST];
+    // Try primary image host through wsrv.nl/proxy fallback chain
+    const imgHosts = [`img.${ORIGIN_HOST}`, `cdn.${ORIGIN_HOST}`];
 
     let response = null;
     for (const imgHost of imgHosts) {
       const url = `https://${imgHost}${imgPath}`;
       response = await fetchImageWithRetry(url, imgHost);
       if (response) break;
-    }
-
-    // If CF-protected hosts failed, try img.* through external CDN directly
-    if (!response && cfOnCooldown) {
-      response = await fetchImageWithRetry(imgUrl, `img.${ORIGIN_HOST}`);
     }
 
     if (!response) {
@@ -952,11 +894,8 @@ app.get("/thumb-proxy/*", async (req, res) => {
   // Concurrency limit
   await acquireImageSlot();
 
-  // Try multiple thumbnail hosts in case primary is blocked
-  const cfOnCooldown = isCfOnCooldown();
-  const thumbHosts = cfOnCooldown
-    ? [`cdn.${ORIGIN_HOST}`, ORIGIN_HOST]
-    : [`thumbnail.${ORIGIN_HOST}`, `cdn.${ORIGIN_HOST}`, `img.${ORIGIN_HOST}`, ORIGIN_HOST];
+  // Try thumbnail hosts through wsrv.nl/proxy fallback chain
+  const thumbHosts = [`thumbnail.${ORIGIN_HOST}`, `cdn.${ORIGIN_HOST}`];
 
   try {
     let response = null;
@@ -964,12 +903,6 @@ app.get("/thumb-proxy/*", async (req, res) => {
       const imgUrl = `https://${thumbHost}${imgPath}`;
       response = await fetchImageWithRetry(imgUrl, thumbHost);
       if (response) break;
-    }
-
-    // If all direct hosts failed, let fetchImageWithRetry try via external CDN
-    if (!response && cfOnCooldown) {
-      const primaryUrl = `https://thumbnail.${ORIGIN_HOST}${imgPath}`;
-      response = await fetchImageWithRetry(primaryUrl, `thumbnail.${ORIGIN_HOST}`);
     }
 
     if (!response) {
@@ -2390,25 +2323,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`   Strategy: direct-first → last-working-proxy → rotate → fallback origins`);
   console.log(`   Health: http://0.0.0.0:${PORT}/healthz`);
 
-  // --- Cloudflare solver: initial solve + periodic refresh ---
-  console.log("🔓 Starting Cloudflare solver for image CDN...");
-  solveCfForImages().then((result) => {
-    if (result) {
-      console.log("✅ Cloudflare image CDN cookies ready");
-    } else {
-      console.warn("⚠️ Initial CF solve failed, will retry periodically");
-    }
-  }).catch((err) => {
-    console.error("❌ CF solver startup error:", err.message);
-  });
-
-  // Periodic refresh every 12 minutes
-  setInterval(() => {
-    if (needsCfRefresh()) {
-      console.log("🔄 Periodic CF cookie refresh...");
-      solveCfForImages().catch((err) => {
-        console.error("❌ CF periodic refresh error:", err.message);
-      });
-    }
-  }, 3 * 60 * 1000); // check every 3 minutes, only solve if expired
+  // --- Cloudflare solver: DISABLED (too resource-heavy, CF blocks with "Attention Required") ---
+  // Images are served via wsrv.nl / weserv.nl external CDN fallback.
+  console.log("ℹ️ CF solver disabled — images proxied via wsrv.nl/weserv.nl");
 });
