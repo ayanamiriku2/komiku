@@ -724,20 +724,28 @@ async function fetchImageViaProxy(url, hostHeader, maxAttempts = 3) {
 // 2. Proxy to img.komiku.org — may work through some proxies
 // 3. Direct to ORIGIN (komiku.org) — no CF on main domain
 // 4. wsrv.nl as last resort
-async function fetchImageWithRetry(imgPath) {
-  const originUrl = `https://${ORIGIN_HOST}${imgPath}`;
-  const imgCdnUrl = `https://img.${ORIGIN_HOST}${imgPath}`;
+// Main image fetch: try multiple hosts via proxy rotation
+// @param {string} imgPath - path like /uploads/manga/...
+// @param {string} preferredHost - e.g. 'img.komiku.org' or 'thumbnail.komiku.org'
+async function fetchImageWithRetry(imgPath, preferredHost) {
+  // Build list of hosts to try (preferred first, then alternatives)
+  const hosts = [preferredHost];
+  if (preferredHost !== `img.${ORIGIN_HOST}`) hosts.push(`img.${ORIGIN_HOST}`);
+  if (preferredHost !== `thumbnail.${ORIGIN_HOST}`) hosts.push(`thumbnail.${ORIGIN_HOST}`);
+  if (preferredHost !== `cdn.${ORIGIN_HOST}`) hosts.push(`cdn.${ORIGIN_HOST}`);
 
-  // === ATTEMPT 1: Origin domain (komiku.org) via proxy ===
-  {
-    const response = await fetchImageViaProxy(originUrl, ORIGIN_HOST, 2);
+  // === ATTEMPT 1: Via proxy rotation (proxy.txt) — try each host ===
+  for (const host of hosts) {
+    const url = `https://${host}${imgPath}`;
+    const response = await fetchImageViaProxy(url, host, 3);
     if (response) return response;
   }
 
-  // === ATTEMPT 2: Direct to origin (komiku.org) — main domain not behind CF ===
-  {
-    const response = await fetchImageSimple(originUrl, {
-      Host: ORIGIN_HOST,
+  // === ATTEMPT 2: Direct fetch (without proxy) — may work for some hosts ===
+  for (const host of hosts) {
+    const url = `https://${host}${imgPath}`;
+    const response = await fetchImageSimple(url, {
+      Host: host,
       "User-Agent": ORIGIN_UA,
       Accept: "image/*,*/*;q=0.8",
       Referer: `https://${ORIGIN_HOST}/`,
@@ -745,31 +753,19 @@ async function fetchImageWithRetry(imgPath) {
     if (response) return response;
   }
 
-  // === ATTEMPT 3: img.komiku.org via proxy (might work through some proxies) ===
-  {
-    const response = await fetchImageViaProxy(imgCdnUrl, `img.${ORIGIN_HOST}`, 2);
-    if (response) return response;
+  // === ATTEMPT 3: wsrv.nl external CDN ===
+  for (const host of [preferredHost, `img.${ORIGIN_HOST}`]) {
+    try {
+      const url = `https://${host}${imgPath}`;
+      const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(url)}&n=-1`;
+      const response = await fetchImageSimple(wsrvUrl, {
+        "User-Agent": IMAGE_UA,
+        Accept: "image/*,*/*;q=0.8",
+      }, undefined, 12000);
+      if (response) return response;
+    } catch (_) {}
+    if (host === preferredHost && preferredHost === `img.${ORIGIN_HOST}`) break;
   }
-
-  // === ATTEMPT 4: wsrv.nl external CDN (last resort) ===
-  try {
-    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(originUrl)}&n=-1`;
-    const response = await fetchImageSimple(wsrvUrl, {
-      "User-Agent": IMAGE_UA,
-      Accept: "image/*,*/*;q=0.8",
-    }, undefined, 12000);
-    if (response) return response;
-  } catch (_) {}
-
-  // === ATTEMPT 5: wsrv.nl with img CDN URL ===
-  try {
-    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgCdnUrl)}&n=-1`;
-    const response = await fetchImageSimple(wsrvUrl, {
-      "User-Agent": IMAGE_UA,
-      Accept: "image/*,*/*;q=0.8",
-    }, undefined, 12000);
-    if (response) return response;
-  } catch (_) {}
 
   return null;
 }
@@ -856,7 +852,7 @@ app.get("/thumb-proxy/*", async (req, res) => {
   await acquireImageSlot();
 
   try {
-    const response = await fetchImageWithRetry(imgPath);
+    const response = await fetchImageWithRetry(imgPath, `thumbnail.${ORIGIN_HOST}`);
 
     if (!response) {
       return res.status(502).set("Cache-Control", "no-cache, no-store").end();
@@ -953,6 +949,8 @@ app.all("/plus-proxy/*", async (req, res) => {
 
     if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript")) {
       let body = response._preReadBody || await response.text();
+      body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
+      body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
       return res.status(response.status).send(body);
@@ -1124,6 +1122,8 @@ app.all("/api-proxy/*", async (req, res) => {
     // Text-based responses: rewrite origin URLs
     if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript")) {
       let body = response._preReadBody || await response.text();
+      body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
+      body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
       body = body.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
@@ -1253,6 +1253,10 @@ app.all("*", async (req, res) => {
       const pageId = uniquePageId(reqPathname);
 
       // --- A. REWRITE SEMUA URL ORIGIN → MIRROR ---
+      // A-img. Rewrite img.komiku.org → mirror/img-proxy
+      html = html.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
+      // A-thumb. Rewrite thumbnail.komiku.org → mirror/thumb-proxy
+      html = html.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       // A0. Rewrite analytics.komiku.org → mirror/analytics-proxy
       html = html.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       // A0b. Rewrite plus.komiku.org → mirror/plus-proxy
@@ -2092,6 +2096,8 @@ app.all("*", async (req, res) => {
       // --- N. FINAL CLEANUP: hapus semua sisa referensi origin ---
       // ==========================================================
       // Pass terakhir untuk memastikan tidak ada URL origin tersisa di HTML
+      html = html.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
+      html = html.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       html = html.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       html = html.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       html = html.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
@@ -2157,6 +2163,8 @@ app.all("*", async (req, res) => {
       contentType.includes("application/json")
     ) {
       let body = response._preReadBody || await response.text();
+      body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
+      body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       body = body.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
