@@ -655,75 +655,23 @@ async function solveCfForImages() {
   return null;
 }
 
-// --- Track Cloudflare 403 hits to avoid spamming invalidation ---
-let cfBlockCount = 0;
-let lastCfBlockTime = 0;
-const CF_BLOCK_INVALIDATE_THRESHOLD = 3; // only invalidate after N blocks
-const CF_BLOCK_WINDOW = 30000; // within 30s window
-
-// Helper: fast direct image fetch with content-type validation (no DDoS-Guard logic)
-async function fetchImageDirect(url, headers, agent, timeout = 8000) {
+// --- Simple image fetch (no CF detection overhead, just fetch and validate content-type) ---
+async function fetchImageSimple(url, headers, agent, timeout = 10000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    // Inject Cloudflare cookies if available
-    if (hasCfCookies()) {
-      const cfUA = getCfUserAgent();
-      if (cfUA) headers["User-Agent"] = cfUA;
-      headers["Cookie"] = getCfCookies();
-    }
-    const opts = { headers, redirect: "follow", signal: controller.signal };
+    const opts = { headers: { ...headers }, redirect: "follow", signal: controller.signal };
     if (agent) opts.agent = agent;
-    // If CF was solved through a specific proxy, prefer that proxy for image requests
-    if (!agent && hasCfCookies() && getCfProxy()) {
-      const proxyAgent = getProxyAgent(getCfProxy());
-      if (proxyAgent) opts.agent = proxyAgent;
-    }
     const response = await fetch(url, opts);
     clearTimeout(timer);
     if (!response.ok) {
-      // Detect Cloudflare block — don't invalidate on every single 403
-      if (response.status === 403) {
-        const body = await response.text().catch(() => "");
-        if (body.includes("cloudflare") || body.includes("cf-") || body.includes("Attention Required")) {
-          const now = Date.now();
-          // Reset counter if outside window
-          if (now - lastCfBlockTime > CF_BLOCK_WINDOW) {
-            cfBlockCount = 0;
-          }
-          cfBlockCount++;
-          lastCfBlockTime = now;
-
-          // Only invalidate + trigger refresh after threshold, and not on cooldown
-          if (cfBlockCount >= CF_BLOCK_INVALIDATE_THRESHOLD && !isCfOnCooldown()) {
-            console.warn(`⛔ Cloudflare blocked ${cfBlockCount} image requests, invalidating cookies...`);
-            invalidateCfCookies();
-            triggerCfRefresh();
-            cfBlockCount = 0;
-          }
-        }
-      } else {
-        try { await response.text(); } catch (_) {}
-      }
+      try { await response.text(); } catch (_) {}
       return null;
     }
-    // CRITICAL: Validate response is actually an image, not an HTML challenge page
+    // Validate response is actually an image
     const ct = response.headers.get("content-type") || "";
-    if (ct.includes("text/html") || ct.includes("text/plain") || ct.includes("text/xml")) {
-      const body = await response.text().catch(() => "");
-      // Detect Cloudflare challenge in 200 response — same throttled approach
-      if (body.includes("cloudflare") || body.includes("cf-")) {
-        const now = Date.now();
-        if (now - lastCfBlockTime > CF_BLOCK_WINDOW) cfBlockCount = 0;
-        cfBlockCount++;
-        lastCfBlockTime = now;
-        if (cfBlockCount >= CF_BLOCK_INVALIDATE_THRESHOLD && !isCfOnCooldown()) {
-          console.warn(`⛔ Cloudflare challenge in image response (${cfBlockCount} hits), invalidating cookies...`);
-          invalidateCfCookies();
-          triggerCfRefresh();
-          cfBlockCount = 0;
-        }
-      }
+    if (ct.includes("text/html") || ct.includes("text/plain")) {
+      try { await response.text(); } catch (_) {}
       return null;
     }
     return response;
@@ -733,80 +681,101 @@ async function fetchImageDirect(url, headers, agent, timeout = 8000) {
   }
 }
 
-// Helper: try fetching image — wsrv.nl FIRST (since CF blocks direct), then proxy, then direct
-async function fetchImageWithRetry(imgUrl, hostHeader) {
-  const parsedUrl = new URL(imgUrl);
-  const imgPath = parsedUrl.pathname + parsedUrl.search;
+// Helper: fetch image via proxy rotation from proxy.txt
+async function fetchImageViaProxy(url, hostHeader, maxAttempts = 3) {
+  if (proxyList.length === 0) return null;
 
-  // Header sets for direct/proxy attempts
-  const headerSets = [
-    {
-      Host: hostHeader,
-      "User-Agent": IMAGE_UA,
-      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-      "Accept-Encoding": "gzip, deflate, br",
-      "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-      Referer: `https://${ORIGIN_HOST}/`,
-      "Sec-Fetch-Dest": "image",
-      "Sec-Fetch-Mode": "no-cors",
-      "Sec-Fetch-Site": "cross-site",
-    },
-    {
-      Host: hostHeader,
+  const headers = {
+    Host: hostHeader,
+    "User-Agent": IMAGE_UA,
+    Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    Referer: `https://${ORIGIN_HOST}/`,
+    "Sec-Fetch-Dest": "image",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "same-origin",
+  };
+
+  // Try last working proxy first
+  if (lastWorkingProxy) {
+    const agent = getProxyAgent(lastWorkingProxy);
+    const response = await fetchImageSimple(url, headers, agent, 10000);
+    if (response) return response;
+    lastWorkingProxy = null; // mark as no longer working
+  }
+
+  // Rotate through proxies
+  for (let i = 0; i < Math.min(maxAttempts, proxyList.length); i++) {
+    const proxyUrl = getNextProxy();
+    if (!proxyUrl) continue;
+    const agent = getProxyAgent(proxyUrl);
+    const response = await fetchImageSimple(url, headers, agent, 10000);
+    if (response) {
+      lastWorkingProxy = proxyUrl;
+      return response;
+    }
+  }
+  return null;
+}
+
+// Main image fetch strategy:
+// 1. Proxy to ORIGIN (komiku.org) — main domain serves images too
+// 2. Proxy to img.komiku.org — may work through some proxies
+// 3. Direct to ORIGIN (komiku.org) — no CF on main domain
+// 4. wsrv.nl as last resort
+async function fetchImageWithRetry(imgPath) {
+  const originUrl = `https://${ORIGIN_HOST}${imgPath}`;
+  const imgCdnUrl = `https://img.${ORIGIN_HOST}${imgPath}`;
+
+  // === ATTEMPT 1: Origin domain (komiku.org) via proxy ===
+  {
+    const response = await fetchImageViaProxy(originUrl, ORIGIN_HOST, 2);
+    if (response) return response;
+  }
+
+  // === ATTEMPT 2: Direct to origin (komiku.org) — main domain not behind CF ===
+  {
+    const response = await fetchImageSimple(originUrl, {
+      Host: ORIGIN_HOST,
       "User-Agent": ORIGIN_UA,
       Accept: "image/*,*/*;q=0.8",
       Referer: `https://${ORIGIN_HOST}/`,
-    },
-  ];
+    }, undefined, 10000);
+    if (response) return response;
+  }
 
-  // === ATTEMPT 1: wsrv.nl (fastest — bypasses Cloudflare entirely) ===
+  // === ATTEMPT 3: img.komiku.org via proxy (might work through some proxies) ===
+  {
+    const response = await fetchImageViaProxy(imgCdnUrl, `img.${ORIGIN_HOST}`, 2);
+    if (response) return response;
+  }
+
+  // === ATTEMPT 4: wsrv.nl external CDN (last resort) ===
   try {
-    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&n=-1`;
-    const response = await fetchImageDirect(wsrvUrl, {
+    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(originUrl)}&n=-1`;
+    const response = await fetchImageSimple(wsrvUrl, {
       "User-Agent": IMAGE_UA,
       Accept: "image/*,*/*;q=0.8",
-    }, undefined, 10000);
+    }, undefined, 12000);
     if (response) return response;
   } catch (_) {}
 
-  // === ATTEMPT 2: images.weserv.nl (alternative wsrv endpoint) ===
+  // === ATTEMPT 5: wsrv.nl with img CDN URL ===
   try {
-    const weservUrl = `https://images.weserv.nl/?url=${encodeURIComponent(imgUrl)}&n=-1`;
-    const response = await fetchImageDirect(weservUrl, {
+    const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(imgCdnUrl)}&n=-1`;
+    const response = await fetchImageSimple(wsrvUrl, {
       "User-Agent": IMAGE_UA,
       Accept: "image/*,*/*;q=0.8",
-    }, undefined, 10000);
+    }, undefined, 12000);
     if (response) return response;
   } catch (_) {}
-
-  // === ATTEMPT 3: Through proxy (if available) ===
-  if (proxyList.length > 0) {
-    const proxyUrl = lastWorkingProxy || getNextProxy();
-    if (proxyUrl) {
-      const agent = getProxyAgent(proxyUrl);
-      const response = await fetchImageDirect(imgUrl, { ...headerSets[0] }, agent, 10000);
-      if (response) {
-        lastWorkingProxy = proxyUrl;
-        return response;
-      }
-    }
-  }
-
-  // === ATTEMPT 4: Direct fetch (last resort — usually blocked by CF) ===
-  const cfAvailable = hasCfCookies() && !isCfOnCooldown();
-  if (cfAvailable) {
-    for (const headers of headerSets) {
-      const response = await fetchImageDirect(imgUrl, { ...headers }, undefined, 8000);
-      if (response) return response;
-    }
-  }
 
   return null;
 }
 
 app.get("/img-proxy/*", async (req, res) => {
   const imgPath = req.originalUrl.replace(/^\/img-proxy/, "");
-  const imgUrl = `https://img.${ORIGIN_HOST}${imgPath}`;
 
   // Check in-memory image cache first
   const cacheKey = `img:${imgPath}`;
@@ -824,15 +793,7 @@ app.get("/img-proxy/*", async (req, res) => {
   await acquireImageSlot();
 
   try {
-    // Try primary image host through wsrv.nl/proxy fallback chain
-    const imgHosts = [`img.${ORIGIN_HOST}`, `cdn.${ORIGIN_HOST}`];
-
-    let response = null;
-    for (const imgHost of imgHosts) {
-      const url = `https://${imgHost}${imgPath}`;
-      response = await fetchImageWithRetry(url, imgHost);
-      if (response) break;
-    }
+    const response = await fetchImageWithRetry(imgPath);
 
     if (!response) {
       return res.status(502).set("Cache-Control", "no-cache, no-store").end();
@@ -866,7 +827,7 @@ app.get("/img-proxy/*", async (req, res) => {
     res.status(200);
     response.body.pipe(res);
   } catch (err) {
-    console.error("Image proxy error:", err.message, "URL:", imgUrl);
+    console.error("Image proxy error:", err.message, "Path:", imgPath);
     res.status(502).set("Cache-Control", "no-cache").end();
   } finally {
     releaseImageSlot();
@@ -894,16 +855,8 @@ app.get("/thumb-proxy/*", async (req, res) => {
   // Concurrency limit
   await acquireImageSlot();
 
-  // Try thumbnail hosts through wsrv.nl/proxy fallback chain
-  const thumbHosts = [`thumbnail.${ORIGIN_HOST}`, `cdn.${ORIGIN_HOST}`];
-
   try {
-    let response = null;
-    for (const thumbHost of thumbHosts) {
-      const imgUrl = `https://${thumbHost}${imgPath}`;
-      response = await fetchImageWithRetry(imgUrl, thumbHost);
-      if (response) break;
-    }
+    const response = await fetchImageWithRetry(imgPath);
 
     if (!response) {
       return res.status(502).set("Cache-Control", "no-cache, no-store").end();
