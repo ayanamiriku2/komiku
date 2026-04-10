@@ -684,7 +684,7 @@ async function fetchImageSimple(url, headers, agent, timeout = 6000) {
 // Main image fetch: DIRECT from server (confirmed working from Railway)
 // @param {string} imgPath - path like /uploads/manga/...
 // @param {string} preferredHost - e.g. 'img.komiku.org' or 'thumbnail.komiku.org'
-async function fetchImageWithRetry(imgPath, preferredHost) {
+async function fetchImageWithRetry(imgPath, preferredHost = `img.${ORIGIN_HOST}`) {
   const headers = {
     "User-Agent": IMAGE_UA,
     Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
