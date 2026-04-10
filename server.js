@@ -953,8 +953,6 @@ app.all("/plus-proxy/*", async (req, res) => {
 
     if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript")) {
       let body = response._preReadBody || await response.text();
-      body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
-      body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
       return res.status(response.status).send(body);
@@ -1126,8 +1124,6 @@ app.all("/api-proxy/*", async (req, res) => {
     // Text-based responses: rewrite origin URLs
     if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript")) {
       let body = response._preReadBody || await response.text();
-      body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
-      body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       body = body.replace(buildOriginRegex(), `https://${mirrorHost}`);
       body = body.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
@@ -1257,10 +1253,6 @@ app.all("*", async (req, res) => {
       const pageId = uniquePageId(reqPathname);
 
       // --- A. REWRITE SEMUA URL ORIGIN → MIRROR ---
-      // A-img. Rewrite img.komiku.org → mirror/img-proxy
-      html = html.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
-      // A-thumb. Rewrite thumbnail.komiku.org → mirror/thumb-proxy
-      html = html.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       // A0. Rewrite analytics.komiku.org → mirror/analytics-proxy
       html = html.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       // A0b. Rewrite plus.komiku.org → mirror/plus-proxy
@@ -2100,8 +2092,6 @@ app.all("*", async (req, res) => {
       // --- N. FINAL CLEANUP: hapus semua sisa referensi origin ---
       // ==========================================================
       // Pass terakhir untuk memastikan tidak ada URL origin tersisa di HTML
-      html = html.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
-      html = html.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       html = html.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       html = html.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       html = html.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
@@ -2167,8 +2157,6 @@ app.all("*", async (req, res) => {
       contentType.includes("application/json")
     ) {
       let body = response._preReadBody || await response.text();
-      body = body.replace(/https?:\/\/(www\.)?img\.komiku\.org/gi, `https://${mirrorHost}/img-proxy`);
-      body = body.replace(/https?:\/\/(www\.)?thumbnail\.komiku\.org/gi, `https://${mirrorHost}/thumb-proxy`);
       body = body.replace(/https?:\/\/(www\.)?analytics\.komiku\.org/gi, `https://${mirrorHost}/analytics-proxy`);
       body = body.replace(/https?:\/\/(www\.)?plus\.komiku\.org/gi, `https://${mirrorHost}/plus-proxy`);
       body = body.replace(/https?:\/\/(www\.)?api\.komiku\.org/gi, `https://${mirrorHost}/api-proxy`);
